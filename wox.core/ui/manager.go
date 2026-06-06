@@ -552,12 +552,28 @@ func (m *Manager) getUILaunchEnvs(ctx context.Context) []string {
 		return nil
 	}
 
+	var envs []string
+
+	// DDE bypass: Deepin 25 ships without at-spi2-core running, so the Flutter
+	// GTK embedder fails at atk_socket_embed (`assertion 'plug_id != NULL'
+	// failed`) and wedges the engine. That leaves the FlView at the GTK default
+	// 10x10 placeholder size, which deepin-kwin refuses to map, and the
+	// platform-thread MethodChannel never services Go's ToggleApp request, so
+	// every WebSocket call times out. The embedder skips the AT-SPI socket
+	// registration when NO_ATK_BRIDGE is set, which lets the engine start
+	// cleanly. Only do this on DDE so screen-reader consumers on other DEs
+	// still see the window. Respect an explicit user override.
+	if os.Getenv("NO_ATK_BRIDGE") == "" && isDeepinDesktop() {
+		logger.Info(ctx, "start ui with NO_ATK_BRIDGE=1 to bypass missing AT-SPI bridge on DDE")
+		envs = append(envs, "NO_ATK_BRIDGE=1")
+	}
+
 	if os.Getenv("GDK_BACKEND") != "" {
-		return nil
+		return envs
 	}
 
 	if os.Getenv("WAYLAND_DISPLAY") == "" || os.Getenv("DISPLAY") == "" {
-		return nil
+		return envs
 	}
 
 	// Bug fix: native Wayland ignores the GTK positioning APIs that Wox uses to
@@ -566,7 +582,16 @@ func (m *Manager) getUILaunchEnvs(ctx context.Context) []string {
 	// Wayland and DISPLAY are present; this keeps the existing X11 move/resize
 	// path working without changing the user's global desktop session.
 	logger.Info(ctx, "start ui with GDK_BACKEND=x11 so Linux launcher positioning uses the X11 path under Wayland")
-	return []string{"GDK_BACKEND=x11"}
+	return append(envs, "GDK_BACKEND=x11")
+}
+
+// isDeepinDesktop reports whether the current session is Deepin Desktop
+// Environment. DDE is the only Linux session we explicitly change behavior for
+// here; other DEs that run at-spi2-core (GNOME, KDE) keep the default ATK
+// bridge so screen readers continue to work.
+func isDeepinDesktop() bool {
+	desktop := strings.ToLower(os.Getenv("XDG_CURRENT_DESKTOP"))
+	return strings.Contains(desktop, "deepin") || strings.Contains(desktop, "dde")
 }
 
 func (m *Manager) StartUIApp(ctx context.Context) error {

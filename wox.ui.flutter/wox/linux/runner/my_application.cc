@@ -101,6 +101,15 @@ static void set_window_shape(GtkWindow *window)
   int width, height;
   gtk_window_get_size(window, &width, &height);
 
+  // DDE (Deepin 25 deepin-kwin) refuses to map a window that still has the
+  // initial 10x10 placeholder size, so the launcher never appears on screen.
+  // Force a real initial size the first time we get a backing GdkWindow.
+  if (width <= 10 || height <= 10)
+  {
+    gtk_window_resize(window, 1280, 720);
+    gtk_window_get_size(window, &width, &height);
+  }
+
   cairo_surface_t *surface =
       cairo_image_surface_create(CAIRO_FORMAT_A1, width, height);
   cairo_t *cr = cairo_create(surface);
@@ -124,6 +133,33 @@ static void on_size_allocate(GtkWidget *widget, GdkRectangle *allocation,
                              gpointer user_data)
 {
   set_window_shape(GTK_WINDOW(user_data));
+}
+
+// Force a real initial size for the window. Called from a g_idle_add so it runs
+// after the window is realized and the GdkWindow is fully created. Without this
+// the window stays at 10x10 and DDE (deepin-kwin on Deepin 25) refuses to map
+// it, leaving the launcher invisible.
+static gboolean force_initial_window_size(gpointer data)
+{
+  GtkWindow *window = GTK_WINDOW(data);
+  if (window == nullptr)
+  {
+    return G_SOURCE_REMOVE;
+  }
+
+  int width = 0, height = 0;
+  gtk_window_get_size(window, &width, &height);
+  g_print("FLUTTER DEBUG: force_initial_window_size before: %dx%d realized=%d mapped=%d\n",
+          width, height,
+          gtk_widget_get_realized(GTK_WIDGET(window)) ? 1 : 0,
+          gtk_widget_get_mapped(GTK_WIDGET(window)) ? 1 : 0);
+  if (width <= 10 || height <= 10)
+  {
+    gtk_window_resize(window, 1280, 720);
+  }
+  gtk_window_get_size(window, &width, &height);
+  g_print("FLUTTER DEBUG: force_initial_window_size after: %dx%d\n", width, height);
+  return G_SOURCE_REMOVE;
 }
 
 // Callback function to handle window focus-out event
@@ -2369,7 +2405,25 @@ static void method_call_cb(FlMethodChannel *channel, FlMethodCall *method_call,
   else if (strcmp(method, "show") == 0)
   {
     save_previous_active_window(self);
+    // Some compositors (notably deepin-kwin on Deepin 25) refuse to map a window
+    // that still has its initial 10x10 size, so the user sees nothing on screen
+    // and the WebSocket show() call appears to hang. Resize first, then show.
+    int current_w = 0, current_h = 0;
+    gtk_window_get_size(window, &current_w, &current_h);
+    if (current_w <= 10 || current_h <= 10)
+    {
+      gtk_window_resize(window, 1280, 720);
+    }
     gtk_widget_show(GTK_WIDGET(window));
+    // Force the window manager to actually map and raise the window. gtk_widget_show()
+    // alone is not enough on some compositors (notably deepin-kwin on Deepin 25),
+    // where the window stays in IsUnMapped state until something explicitly presents it.
+    gtk_window_present(window);
+    GdkWindow *gdk_window = gtk_widget_get_window(GTK_WIDGET(window));
+    if (gdk_window != nullptr)
+    {
+      gdk_window_show(gdk_window);
+    }
     response =
         FL_METHOD_RESPONSE(fl_method_success_response_new(fl_value_new_null()));
   }
@@ -2542,10 +2596,18 @@ static void my_application_activate(GApplication *application)
   }
 
   gtk_window_set_default_size(window, 1280, 720);
+  // GTK ignores gtk_window_resize before the window is realized, so also force
+  // the initial geometry after the GdkWindow becomes available. DDE refuses to
+  // map windows that are still at the default 10x10 placeholder size, which is
+  // what leaves the launcher invisible on Deepin 25.
+  g_idle_add(force_initial_window_size, window);
 
   // Prevent notifications and taskbar entries
   gtk_window_set_skip_taskbar_hint(window, TRUE);
-  gtk_window_set_type_hint(window, GDK_WINDOW_TYPE_HINT_UTILITY);
+  // DDE (Deepin Desktop Environment) does not handle GDK_WINDOW_TYPE_HINT_UTILITY
+  // windows well, which can leave the window unmapped after gtk_widget_show().
+  // Use NORMAL so all compositors (including deepin-kwin) treat it as a regular window.
+  gtk_window_set_type_hint(window, GDK_WINDOW_TYPE_HINT_NORMAL);
   gtk_window_set_keep_above(window, TRUE);
 
   g_autoptr(FlDartProject) project = fl_dart_project_new();
@@ -2615,10 +2677,19 @@ static gboolean my_application_local_command_line(GApplication *application,
 
   g_application_activate(application);
 
-  // hide at startup
+  // Show the window at startup. The Flutter engine only starts the Dart isolate
+  // (loading libapp.so) once the FlView is realized, and the view is only
+  // realized when the window is mapped. Without an explicit show here the
+  // window stays in the withdrawn state, the engine never starts, Dart's main()
+  // never runs, and the WebSocket / MethodChannel handlers that the backend
+  // talks to are never registered — so every ToggleApp / ReloadChatResources
+  // request from the Go side times out. The Dart side controls subsequent
+  // show/hide through the com.wox.linux_window_manager method channel; this
+  // initial show is the bootstrap that lets the engine come up in the first
+  // place.
   if (self->window != NULL)
   {
-    gtk_widget_hide(GTK_WIDGET(self->window));
+    gtk_widget_show_all(GTK_WIDGET(self->window));
   }
 
   *exit_status = 0;
